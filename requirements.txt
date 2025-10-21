@@ -1,0 +1,8 @@
+# Stable Corner Detector - Dependencies
+# Python 3.7+ required
+
+# Core Computer Vision Library
+opencv-python>=4.5.0
+
+# Numerical Computing
+numpy>=1.19.0
