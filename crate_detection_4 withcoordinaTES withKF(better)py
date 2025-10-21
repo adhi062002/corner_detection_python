@@ -1,0 +1,220 @@
+"""
+Predictive Corner Detector with Kalman Filter (No GUI)
+Author: Adithya Satheesh (Modified by AI)
+Date: October 19, 2025
+Description: A non-interactive script that uses a robust segmentation pipeline
+             and a Kalman Filter for predictive, low-lag tracking of a rectangular
+             object's corners. (NumPy dtype bug fixed).
+"""
+
+import cv2
+import numpy as np
+from collections import deque
+import time
+
+class KalmanTracker:
+    def __init__(self):
+        """Initializes a Kalman Filter for tracking a rectangle's state [x, y, w, h]."""
+        self.kalman = cv2.KalmanFilter(8, 4)
+        self.kalman.transitionMatrix = np.array([
+            [1, 0, 0, 0, 1, 0, 0, 0], [0, 1, 0, 0, 0, 1, 0, 0],
+            [0, 0, 1, 0, 0, 0, 1, 0], [0, 0, 0, 1, 0, 0, 0, 1],
+            [0, 0, 0, 0, 1, 0, 0, 0], [0, 0, 0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 0, 0, 1, 0], [0, 0, 0, 0, 0, 0, 0, 1]
+        ], np.float32)
+        self.kalman.measurementMatrix = np.array([
+            [1, 0, 0, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0, 0, 0], [0, 0, 0, 1, 0, 0, 0, 0]
+        ], np.float32)
+        self.kalman.processNoiseCov = np.eye(8, dtype=np.float32) * 1e-2
+        self.kalman.measurementNoiseCov = np.eye(4, dtype=np.float32) * 1e-1
+        self.kalman.errorCovPost = np.eye(8, dtype=np.float32) * 1
+        self.initialized = False
+
+    def initialize(self, measurement):
+        self.kalman.statePost = np.array([
+            measurement[0], measurement[1], measurement[2], measurement[3],
+            0, 0, 0, 0
+        ], np.float32)
+        self.initialized = True
+
+    def predict(self):
+        return self.kalman.predict()
+
+    def correct(self, measurement):
+        return self.kalman.correct(np.array(measurement, dtype=np.float32))
+
+class CornerDetector:
+    def __init__(self):
+        """Initializes the corner detector with hard-coded parameters."""
+        self.blur_size = 7
+        self.adaptive_block_size = 55
+        self.adaptive_c = 7
+        self.invert_threshold = 1
+        self.morph_close_size = 15
+        self.min_area = 2000
+        self.max_area_ratio = 0.80
+        self.epsilon = 0.02
+        self.rectangularity_threshold = 0.80
+        self.tracker = KalmanTracker()
+        self.lost_frames_count = 0
+        self.re_detection_frames = 10
+        self.fps_history = deque(maxlen=30)
+
+    def segment_image(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        kernel_size = self.blur_size if self.blur_size % 2 == 1 and self.blur_size > 0 else 1
+        blurred = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
+        block_size = self.adaptive_block_size if self.adaptive_block_size % 2 == 1 and self.adaptive_block_size > 1 else 3
+        threshold_type = cv2.THRESH_BINARY_INV if self.invert_threshold == 1 else cv2.THRESH_BINARY
+        segmented_mask = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, threshold_type, block_size, self.adaptive_c)
+        if self.morph_close_size > 0:
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (self.morph_close_size, self.morph_close_size))
+            segmented_mask = cv2.morphologyEx(segmented_mask, cv2.MORPH_CLOSE, kernel)
+        return segmented_mask
+
+    def find_largest_rectangle(self, segmented_mask, frame_shape):
+        contours, _ = cv2.findContours(segmented_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        max_area = frame_shape[0] * frame_shape[1] * self.max_area_ratio
+        rectangles = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            if not (self.min_area < area < max_area): continue
+            hull = cv2.convexHull(c)
+            peri = cv2.arcLength(hull, True)
+            approx = cv2.approxPolyDP(hull, self.epsilon * peri, True)
+            if len(approx) == 4:
+                _, (w, h), _ = cv2.minAreaRect(hull)
+                if w*h > 0 and (cv2.contourArea(hull) / (w*h)) >= self.rectangularity_threshold:
+                    rectangles.append({'corners': approx, 'area': cv2.contourArea(hull)})
+        if not rectangles: return None
+        rectangles.sort(key=lambda x: x['area'], reverse=True)
+        return rectangles[0]
+
+    def rect_to_measurement(self, rect_corners):
+        (center, (width, height), _) = cv2.minAreaRect(rect_corners)
+        return [center[0], center[1], width, height]
+    
+    def state_to_corners(self, kalman_state):
+        x = kalman_state[0, 0]
+        y = kalman_state[1, 0]
+        w = kalman_state[2, 0]
+        h = kalman_state[3, 0]
+        center = (x, y)
+        size = (w, h)
+        box_points = cv2.boxPoints((center, size, 0))
+        
+        # --- BUG FIX IS HERE ---
+        # Replace deprecated np.int0 with the modern .astype(np.int32)
+        return box_points.astype(np.int32)
+        # --- END OF FIX ---
+
+    def draw_corners(self, frame, corners):
+        output = frame.copy()
+        ordered_corners = self.order_corners(corners)
+        colors = [(0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0)]
+        labels = ['TL', 'TR', 'BR', 'BL']
+        
+        for i, (corner, color, label) in enumerate(zip(ordered_corners, colors, labels)):
+            x, y = int(corner[0]), int(corner[1])
+            cv2.circle(output, (x, y), 8, color, -1)
+            cv2.circle(output, (x, y), 10, (255, 255, 255), 2)
+            cv2.putText(output, f'{label} ({x},{y})', (x + 15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+        for i in range(4):
+            pt1 = tuple(ordered_corners[i].astype(int))
+            pt2 = tuple(ordered_corners[(i + 1) % 4].astype(int))
+            cv2.line(output, pt1, pt2, (0, 255, 255), 2)
+        return output
+
+    def order_corners(self, c):
+        p=c.reshape(4,2); o=np.zeros((4,2),dtype=np.float32); s=p.sum(axis=1); d=np.diff(p,axis=1)
+        o[0]=p[np.argmin(s)]; o[2]=p[np.argmax(s)]; o[1]=p[np.argmin(d)]; o[3]=p[np.argmax(d)]
+        return o
+
+    def add_info_overlay(self, frame, has_corners, fps):
+        overlay = frame.copy(); cv2.rectangle(overlay, (10, 10), (280, 80), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+        status = "TRACKING" if has_corners else "SEARCHING..."; status_color = (0, 255, 0) if has_corners else (0, 0, 255)
+        cv2.putText(frame, "Kalman Corner Detector", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(frame, f'FPS: {fps:.1f}', (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, status, (180, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+        return frame
+
+    def process_frame(self, frame, show_debug=False):
+        start_time = time.time()
+        
+        segmented_mask = self.segment_image(frame)
+        best_rectangle = self.find_largest_rectangle(segmented_mask, frame.shape)
+        
+        output = frame.copy()
+        corners = None
+        
+        if best_rectangle is not None:
+            self.lost_frames_count = 0
+            measurement = self.rect_to_measurement(best_rectangle['corners'])
+            if not self.tracker.initialized:
+                self.tracker.initialize(measurement)
+            else:
+                self.tracker.correct(measurement)
+        else:
+            self.lost_frames_count += 1
+            if self.lost_frames_count > self.re_detection_frames:
+                self.tracker.initialized = False
+        
+        if self.tracker.initialized:
+            predicted_state = self.tracker.predict()
+            corners = self.state_to_corners(predicted_state)
+            output = self.draw_corners(output, corners)
+            
+        elapsed_time = time.time() - start_time
+        fps = 1.0 / elapsed_time if elapsed_time > 0 else 999.0
+        self.fps_history.append(fps)
+        avg_fps = np.mean(self.fps_history)
+        output = self.add_info_overlay(output, self.tracker.initialized, avg_fps)
+        
+        debug = None
+        if show_debug:
+            debug = cv2.cvtColor(segmented_mask, cv2.COLOR_GRAY2BGR)
+            if best_rectangle:
+                 cv2.drawContours(debug, [best_rectangle['corners']], -1, (0,255,0), 2)
+        
+        return output, debug
+
+
+def main():
+    cap = cv2.VideoCapture(1)
+    if not cap.isOpened(): print("ERROR: Cannot open webcam!"); return
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640); cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    
+    detector = CornerDetector()
+    
+    print("\n" + "=" * 60)
+    print(" Kalman Filter Corner Detector Running...")
+    print("  - Using predictive tracking for smooth, low-lag results.")
+    print("\n CONTROLS:")
+    print("  'd' - Toggle Debug View")
+    print("  'q' - Quit")
+    print("=" * 60)
+    
+    show_debug = False; debug_window_name = "Debug View"
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret: break
+        
+        output, debug = detector.process_frame(frame, show_debug)
+        cv2.imshow('Corner Detection', output)
+        
+        if show_debug and debug is not None: cv2.imshow(debug_window_name, debug)
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'): break
+        elif key == ord('d'):
+            show_debug = not show_debug
+            if not show_debug: cv2.destroyWindow(debug_window_name)
+    
+    cap.release(); cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()

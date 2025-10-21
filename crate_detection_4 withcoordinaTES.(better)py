@@ -1,0 +1,243 @@
+"""
+Stable Corner Detector (No GUI)
+Author: Adithya Satheesh (Modified by AI)
+Date: October 19, 2025
+Description: A simplified, non-interactive script that uses a robust segmentation
+             pipeline and heavy temporal smoothing to provide stable corner detection
+             for rectangular objects, displaying the coordinates of each corner.
+"""
+
+import cv2
+import numpy as np
+from collections import deque
+import time
+
+
+class CornerDetector:
+    def __init__(self):
+        """
+        Initialize the corner detector with hard-coded, optimized parameters.
+        All tuning happens by changing the values in this section.
+        """
+        
+        # --- CORE DETECTION PARAMETERS ---
+        self.blur_size = 7
+        self.adaptive_block_size = 55
+        self.adaptive_c = 7
+        self.invert_threshold = 1
+        self.morph_close_size = 15
+        self.min_area = 2000
+        self.max_area_ratio = 0.80
+        self.epsilon = 0.02
+        self.rectangularity_threshold = 0.80
+        
+        # --- STABILITY PARAMETERS ---
+        self.smoothing_factor = 20
+        self.corner_history = deque(maxlen=self.smoothing_factor)
+        
+        # --- General ---
+        self.fps_history = deque(maxlen=30)
+
+    def segment_image(self, frame):
+        """Segment the image using grayscale adaptive thresholding and morphology."""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        kernel_size = self.blur_size if self.blur_size % 2 == 1 and self.blur_size > 0 else 1
+        blurred = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
+        
+        block_size = self.adaptive_block_size if self.adaptive_block_size % 2 == 1 and self.adaptive_block_size > 1 else 3
+        threshold_type = cv2.THRESH_BINARY_INV if self.invert_threshold == 1 else cv2.THRESH_BINARY
+        
+        segmented_mask = cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, threshold_type,
+            block_size, self.adaptive_c
+        )
+        
+        if self.morph_close_size > 0:
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (self.morph_close_size, self.morph_close_size))
+            segmented_mask = cv2.morphologyEx(segmented_mask, cv2.MORPH_CLOSE, kernel)
+        
+        return segmented_mask
+
+    def is_rectangular(self, contour):
+        """Check if a contour is sufficiently rectangular by checking its solidity."""
+        _, (width, height), _ = cv2.minAreaRect(contour)
+        contour_area = cv2.contourArea(contour)
+        bounding_box_area = width * height
+        if bounding_box_area == 0: return False
+        ratio = contour_area / bounding_box_area
+        return ratio >= self.rectangularity_threshold
+
+    def find_rectangles(self, segmented_mask, frame_shape):
+        """Find all valid rectangles and return them sorted by area."""
+        contours, _ = cv2.findContours(segmented_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        max_area = frame_shape[0] * frame_shape[1] * self.max_area_ratio
+        
+        rectangles = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            if not (self.min_area < area < max_area):
+                continue
+            
+            hull = cv2.convexHull(c)
+            peri = cv2.arcLength(hull, True)
+            approx = cv2.approxPolyDP(hull, self.epsilon * peri, True)
+            
+            if len(approx) == 4 and self.is_rectangular(hull):
+                rectangles.append({'corners': approx, 'area': cv2.contourArea(hull)})
+
+        rectangles.sort(key=lambda x: x['area'], reverse=True)
+        return rectangles
+
+    def order_corners(self, corners):
+        """Order corners: Top-Left, Top-Right, Bottom-Right, Bottom-Left."""
+        pts = corners.reshape(4, 2)
+        ordered = np.zeros((4, 2), dtype=np.float32)
+        s = pts.sum(axis=1)
+        diff = np.diff(pts, axis=1)
+        ordered[0] = pts[np.argmin(s)]
+        ordered[2] = pts[np.argmax(s)]
+        ordered[1] = pts[np.argmin(diff)]
+        ordered[3] = pts[np.argmax(diff)]
+        return ordered
+
+    def smooth_corners(self, corners):
+        """Apply heavy temporal smoothing to stabilize corner positions."""
+        self.corner_history.append(corners)
+        smoothed = np.mean(self.corner_history, axis=0)
+        return smoothed.astype(np.float32)
+
+    def draw_corners(self, frame, corners):
+        """Draw the 4 corners with labels and coordinates on the frame."""
+        output = frame.copy()
+        colors = [(0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0)]
+        labels = ['TL', 'TR', 'BR', 'BL']
+        
+        for i, (corner, color, label) in enumerate(zip(corners, colors, labels)):
+            x, y = int(corner[0]), int(corner[1])
+            
+            # Draw the corner circle and its outline
+            cv2.circle(output, (x, y), 8, color, -1)
+            cv2.circle(output, (x, y), 10, (255, 255, 255), 2)
+            
+            # --- NEW: ADD COORDINATE TEXT ---
+            label_text = f'{label}'
+            coord_text = f'({x},{y})'
+            
+            # Position the text slightly to the right of the corner
+            text_pos_x = x + 15
+            text_pos_y = y + 5
+            
+            # Draw the main label (e.g., 'TL')
+            cv2.putText(output, label_text, (text_pos_x, text_pos_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                       
+            # Draw the coordinate text below the main label in white
+            cv2.putText(output, coord_text, (text_pos_x, text_pos_y + 18), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        
+        # Draw the lines connecting the corners
+        for i in range(4):
+            pt1 = tuple(corners[i].astype(int))
+            pt2 = tuple(corners[(i + 1) % 4].astype(int))
+            cv2.line(output, pt1, pt2, (0, 255, 255), 2)
+            
+        return output
+
+    def add_info_overlay(self, frame, has_corners, fps):
+        """Draw a simple info overlay on the top-left of the frame."""
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (10, 10), (280, 80), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+        
+        status = "DETECTED" if has_corners else "SEARCHING..."
+        status_color = (0, 255, 0) if has_corners else (0, 0, 255)
+        
+        cv2.putText(frame, "Stable Corner Detector", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(frame, f'FPS: {fps:.1f}', (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, status, (180, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+        return frame
+
+    def process_frame(self, frame, show_debug=False):
+        """Main processing pipeline for a single frame."""
+        start_time = time.time()
+        
+        segmented_mask = self.segment_image(frame)
+        rectangles = self.find_rectangles(segmented_mask, frame.shape)
+
+        output = frame.copy()
+        corners = None
+        
+        if rectangles:
+            best_rectangle = rectangles[0]
+            ordered_corners = self.order_corners(best_rectangle['corners'])
+            corners = self.smooth_corners(ordered_corners)
+            output = self.draw_corners(output, corners)
+        else:
+            if self.corner_history:
+                self.corner_history.popleft()
+
+        elapsed_time = time.time() - start_time
+        fps = 1.0 / elapsed_time if elapsed_time > 0 else 999.0
+        self.fps_history.append(fps)
+        avg_fps = np.mean(self.fps_history)
+        output = self.add_info_overlay(output, corners is not None, avg_fps)
+        
+        debug = None
+        if show_debug:
+            debug = cv2.cvtColor(segmented_mask, cv2.COLOR_GRAY2BGR)
+            if rectangles:
+                 for i, rect in enumerate(rectangles[:5]):
+                     color = (0, 255, 0) if i == 0 else (100, 100, 255)
+                     cv2.drawContours(debug, [rect['corners']], -1, color, 2)
+        
+        return output, debug
+
+
+def main():
+    cap = cv2.VideoCapture(1) # Try changing to 1 if 0 is not your camera
+    if not cap.isOpened():
+        print("ERROR: Cannot open webcam!")
+        return
+    
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    
+    detector = CornerDetector()
+    
+    print("\n" + "=" * 60)
+    print(" Stable Corner Detector Running...")
+    print("  - All parameters are hard-coded in the script.")
+    print("  - Corner coordinates are now displayed on screen.")
+    print("\n CONTROLS:")
+    print("  'd' - Toggle Debug View (shows the segmentation mask)")
+    print("  'q' - Quit")
+    print("=" * 60)
+    
+    show_debug = False
+    debug_window_name = "Debug View"
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret: break
+        
+        output, debug = detector.process_frame(frame, show_debug)
+        cv2.imshow('Corner Detection', output)
+        
+        if show_debug and debug is not None:
+            cv2.imshow(debug_window_name, debug)
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'): 
+            break
+        elif key == ord('d'):
+            show_debug = not show_debug
+            if not show_debug:
+                cv2.destroyWindow(debug_window_name)
+    
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
