@@ -14,16 +14,27 @@
   },
   "stability": {
     "smoothing_factor": 20,
-    "subpixel_refinement": true
+    "subpixel_refinement": true,
+    "depth_smoothing_factor": 10
+  },
+  "depth": {
+    "min_depth": 0.1,       # Minimum valid depth (meters)
+    "max_depth": 5.0,       # Maximum valid depth (meters)
+    "depth_consistency_threshold": 0.05,  # Max allowed depth variance for a corner (meters)
+    "use_depth_segmentation": true,
+    "depth_segmentation_threshold": 0.5   # Depth threshold for segmentation (meters)
+  },
+  "camera": {
+    "rgb_device_id": 0,
+    "depth_device_id": 0,
+    "width": 640,
+    "height": 480,
+    "fps": 30
   },
   "debug": {
     "show_debug": false,
+    "show_3d": false,
     "save_results": false,
     "log_level": "INFO"
-  },
-  "camera": {
-    "device_id": 1,
-    "width": 640,
-    "height": 480
   }
 }
