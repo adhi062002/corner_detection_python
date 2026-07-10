@@ -6,3 +6,5 @@ opencv-python>=4.5.0
 
 # Numerical Computing
 numpy>=1.19.0
+
+pyrealsense2
