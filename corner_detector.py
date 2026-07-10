@@ -1,16 +1,15 @@
 """
-Stable Corner Detector (Improved)
+Stable Corner Detector with Depth Camera Support
 Author: Adithya Satheesh (Modified by AI)
 Date: July 10, 2026
 Description:
-    A robust, non-interactive script for stable corner detection of rectangular objects.
+    A script for stable corner detection of rectangular objects using RGB + Depth data.
     Features:
-    - Dynamic parameter scaling with frame size
-    - Subpixel corner refinement
-    - Configurable via JSON
-    - Better contour filtering (aspect ratio, convexity)
-    - Logging and error handling
-    - Debug visualizations
+    - 2D corner detection (RGB)
+    - 3D corner localization (Depth)
+    - Depth-based filtering
+    - Pose estimation (PnP)
+    - 3D visualization
 """
 
 import cv2
@@ -21,6 +20,9 @@ import time
 from collections import deque
 from typing import Optional, Tuple, List, Dict, Any
 
+# --- PyRealSense2 Imports ---
+import pyrealsense2 as rs
+
 # --- Setup Logging ---
 logging.basicConfig(
     level=logging.INFO,
@@ -28,15 +30,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class CornerDetector:
+class DepthCornerDetector:
     def __init__(self, config_path: str = "config.json"):
         """
-        Initialize the corner detector with parameters from a config file.
+        Initialize the corner detector with RGB + Depth support.
         """
         self.load_config(config_path)
         self.corner_history = deque(maxlen=self.smoothing_factor)
+        self.depth_corner_history = deque(maxlen=self.depth_smoothing_factor)
         self.fps_history = deque(maxlen=30)
-        logger.info("CornerDetector initialized with config: %s", config_path)
+        self.pipeline = None
+        self.config = rs.config()
+        self._init_realsense()
+        logger.info("DepthCornerDetector initialized with config: %s", config_path)
 
     def load_config(self, config_path: str) -> None:
         """Load parameters from a JSON config file."""
@@ -62,10 +68,28 @@ class CornerDetector:
             stability = config["stability"]
             self.smoothing_factor = stability["smoothing_factor"]
             self.subpixel_refinement = stability["subpixel_refinement"]
+            self.depth_smoothing_factor = stability["depth_smoothing_factor"]
+
+            # Depth parameters
+            depth = config["depth"]
+            self.min_depth = depth["min_depth"]
+            self.max_depth = depth["max_depth"]
+            self.depth_consistency_threshold = depth["depth_consistency_threshold"]
+            self.use_depth_segmentation = depth["use_depth_segmentation"]
+            self.depth_segmentation_threshold = depth["depth_segmentation_threshold"]
+
+            # Camera parameters
+            camera = config["camera"]
+            self.rgb_device_id = camera["rgb_device_id"]
+            self.depth_device_id = camera["depth_device_id"]
+            self.width = camera["width"]
+            self.height = camera["height"]
+            self.fps = camera["fps"]
 
             # Debug parameters
             debug = config["debug"]
             self.show_debug = debug["show_debug"]
+            self.show_3d = debug["show_3d"]
             self.save_results = debug["save_results"]
 
             logger.info("Config loaded successfully.")
@@ -75,6 +99,7 @@ class CornerDetector:
 
     def _set_defaults(self) -> None:
         """Set default parameters if config loading fails."""
+        # Core detection
         self.blur_size = 7
         self.adaptive_block_size_ratio = 0.1
         self.adaptive_c = 7
@@ -86,15 +111,95 @@ class CornerDetector:
         self.rectangularity_threshold = 0.80
         self.aspect_ratio_threshold = 2.0
         self.convexity_threshold = 0.95
+
+        # Stability
         self.smoothing_factor = 20
         self.subpixel_refinement = True
+        self.depth_smoothing_factor = 10
+
+        # Depth
+        self.min_depth = 0.1
+        self.max_depth = 5.0
+        self.depth_consistency_threshold = 0.05
+        self.use_depth_segmentation = True
+        self.depth_segmentation_threshold = 0.5
+
+        # Camera
+        self.rgb_device_id = 0
+        self.depth_device_id = 0
+        self.width = 640
+        self.height = 480
+        self.fps = 30
+
+        # Debug
         self.show_debug = False
+        self.show_3d = False
         self.save_results = False
 
-    def segment_image(self, frame: np.ndarray) -> np.ndarray:
+    def _init_realsense(self) -> None:
+        """Initialize the RealSense pipeline."""
+        try:
+            self.pipeline = rs.pipeline()
+            self.config.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)
+            self.config.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
+            self.config.enable_record_to_file("output.bag")  # Optional: Record data
+            self.pipeline.start(self.config)
+
+            # Get camera intrinsics for RGB and Depth
+            self.rgb_intrinsics = self._get_intrinsics(rs.stream.color)
+            self.depth_intrinsics = self._get_intrinsics(rs.stream.depth)
+            self.depth_to_rgb_extrinsics = self._get_extrinsics(rs.stream.depth, rs.stream.color)
+            self.rgb_to_depth_extrinsics = self._get_extrinsics(rs.stream.color, rs.stream.depth)
+
+            logger.info("RealSense pipeline initialized.")
+        except Exception as e:
+            logger.error("Failed to initialize RealSense: %s", e)
+            raise
+
+    def _get_intrinsics(self, stream: rs.stream) -> rs.intrinsics:
+        """Get camera intrinsics for a given stream."""
+        profile = self.pipeline.get_active_profile()
+        stream_profile = profile.get_stream(stream)
+        intrinsics = stream_profile.as_video_stream_profile().get_intrinsics()
+        return intrinsics
+
+    def _get_extrinsics(self, from_stream: rs.stream, to_stream: rs.stream) -> rs.extrinsics:
+        """Get extrinsics (rotation/translation) between two streams."""
+        profile = self.pipeline.get_active_profile()
+        from_profile = profile.get_stream(from_stream)
+        to_profile = profile.get_stream(to_stream)
+        extrinsics = from_profile.get_extrinsics_to(to_profile)
+        return extrinsics
+
+    def get_frames(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Capture synchronized RGB + Depth frames.
+        Returns:
+            - RGB frame (BGR format)
+            - Depth frame (16-bit, meters)
+        """
+        try:
+            frames = self.pipeline.wait_for_frames()
+            color_frame = frames.get_color_frame()
+            depth_frame = frames.get_depth_frame()
+
+            if not color_frame or not depth_frame:
+                return None, None
+
+            # Convert to numpy arrays
+            rgb_frame = np.asanyarray(color_frame.get_data())
+            depth_frame = np.asanyarray(depth_frame.get_data()).astype(np.float32)
+            depth_frame = depth_frame / 1000.0  # Convert mm to meters
+
+            return rgb_frame, depth_frame
+        except Exception as e:
+            logger.error("Failed to get frames: %s", e)
+            return None, None
+
+    def segment_image(self, frame: np.ndarray, depth_frame: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Segment the image using adaptive thresholding and morphology.
-        Dynamically scales block size with frame dimensions.
+        Optionally uses depth for additional segmentation.
         """
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
@@ -116,6 +221,14 @@ class CornerDetector:
         if self.morph_close_size > 0:
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (self.morph_close_size, self.morph_close_size))
             segmented_mask = cv2.morphologyEx(segmented_mask, cv2.MORPH_CLOSE, kernel)
+
+        # Depth-based segmentation (optional)
+        if depth_frame is not None and self.use_depth_segmentation:
+            depth_mask = np.logical_and(
+                depth_frame >= self.depth_segmentation_threshold - 0.1,
+                depth_frame <= self.depth_segmentation_threshold + 0.1
+            ).astype(np.uint8) * 255
+            segmented_mask = cv2.bitwise_and(segmented_mask, depth_mask)
 
         return segmented_mask
 
@@ -193,7 +306,6 @@ class CornerDetector:
         if not self.subpixel_refinement:
             return corners
 
-        # Prepare corners for cornerSubPix (requires float32 and specific shape)
         corners_float = corners.reshape(-1, 1, 2).astype(np.float32)
         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.001)
         try:
@@ -209,8 +321,116 @@ class CornerDetector:
         smoothed = np.mean(self.corner_history, axis=0)
         return smoothed.astype(np.float32)
 
-    def draw_corners(self, frame: np.ndarray, corners: np.ndarray) -> np.ndarray:
-        """Draw the 4 corners with labels and coordinates on the frame."""
+    def get_3d_corners(
+        self,
+        corners_2d: np.ndarray,
+        depth_frame: np.ndarray,
+        rgb_intrinsics: rs.intrinsics,
+        depth_intrinsics: rs.intrinsics,
+        depth_to_rgb_extrinsics: rs.extrinsics
+    ) -> np.ndarray:
+        """
+        Convert 2D corners to 3D world coordinates using depth.
+        Args:
+            corners_2d: (4, 2) array of 2D corner coordinates (x, y)
+            depth_frame: Depth frame (meters)
+            rgb_intrinsics: RGB camera intrinsics
+            depth_intrinsics: Depth camera intrinsics
+            depth_to_rgb_extrinsics: Extrinsics from depth to RGB
+        Returns:
+            (4, 3) array of 3D corners (X, Y, Z) in meters
+        """
+        corners_3d = np.zeros((4, 3), dtype=np.float32)
+
+        # Get depth sensor intrinsics
+        depth_intr = depth_intrinsics
+        rgb_intr = rgb_intrinsics
+
+        # Get extrinsics (depth to RGB)
+        extr = depth_to_rgb_extrinsics
+        rotation = np.array(extr.rotation).reshape(3, 3)
+        translation = np.array(extr.translation)
+
+        for i, (x, y) in enumerate(corners_2d):
+            # Get depth at (x, y) in RGB frame
+            # First, undistort the RGB pixel
+            rgb_pixel = rs.rs2_deproject_pixel_to_point(
+                rgb_intr, [x, y], 1.0  # We assume depth=1 for deprojection (we'll scale later)
+            )
+            rgb_pixel = np.array(rgb_pixel)[:2]  # Only need (x, y)
+
+            # Map RGB pixel to depth frame
+            depth_pixel = rs.rs2_transform_point_to_point(
+                extr, rgb_intr, rgb_pixel
+            )
+            depth_x, depth_y = int(depth_pixel[0]), int(depth_pixel[1])
+
+            # Check if depth pixel is within bounds
+            if 0 <= depth_x < depth_frame.shape[1] and 0 <= depth_y < depth_frame.shape[0]:
+                depth = depth_frame[depth_y, depth_x]
+                if self.min_depth <= depth <= self.max_depth:
+                    # Deproject depth pixel to 3D
+                    point_3d = rs.rs2_deproject_pixel_to_point(
+                        depth_intr, [depth_x, depth_y], depth
+                    )
+                    corners_3d[i] = point_3d
+                else:
+                    logger.warning(f"Corner {i} has invalid depth: {depth}")
+                    corners_3d[i] = [0, 0, 0]
+            else:
+                logger.warning(f"Corner {i} maps outside depth frame: ({depth_x}, {depth_y})")
+                corners_3d[i] = [0, 0, 0]
+
+        return corners_3d
+
+    def smooth_3d_corners(self, corners_3d: np.ndarray) -> np.ndarray:
+        """Apply temporal smoothing to 3D corner positions."""
+        self.depth_corner_history.append(corners_3d)
+        smoothed = np.mean(self.depth_corner_history, axis=0)
+        return smoothed.astype(np.float32)
+
+    def estimate_pose(self, corners_2d: np.ndarray, corners_3d: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Estimate the 6DOF pose (rotation and translation) of the rectangle.
+        Uses PnP (Perspective-n-Point) with known 3D corners.
+        Assumes the rectangle is axis-aligned in 3D space (e.g., lying flat on a table).
+        """
+        # Define the 3D model of the rectangle (assume it's 1x1 meters for simplicity)
+        # You can replace this with the actual dimensions if known
+        model_3d = np.array([
+            [0, 0, 0],      # Top-Left
+            [1, 0, 0],      # Top-Right
+            [1, 1, 0],      # Bottom-Right
+            [0, 1, 0]       # Bottom-Left
+        ], dtype=np.float32)
+
+        # Use the first 3 corners for PnP (4th is redundant)
+        image_points = corners_2d[:3].reshape(3, 1, 2)
+        object_points = model_3d[:3].reshape(3, 1, 3)
+
+        # Camera matrix (from RGB intrinsics)
+        camera_matrix = np.array([
+            [self.rgb_intrinsics.fx, 0, self.rgb_intrinsics.ppx],
+            [0, self.rgb_intrinsics.fy, self.rgb_intrinsics.ppy],
+            [0, 0, 1]
+        ], dtype=np.float32)
+
+        # Distortion coefficients (assume zero for simplicity)
+        dist_coeffs = np.zeros((5, 1), dtype=np.float32)
+
+        # Solve PnP
+        success, rvec, tvec = cv2.solvePnP(
+            object_points, image_points, camera_matrix, dist_coeffs
+        )
+
+        if success:
+            return rvec, tvec
+        else:
+            logger.warning("PnP failed. Returning zeros.")
+            return np.zeros(3), np.zeros(3)
+
+    def draw_corners(self, frame: np.ndarray, corners: np.ndarray, corners_3d: Optional[np.ndarray] = None) -> np.ndarray:
+        """Draw the 4 corners with labels, coordinates, and 3D info on the frame."""
         output = frame.copy()
         colors = [(0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0)]  # TL, TR, BR, BL
         labels = ["TL", "TR", "BR", "BL"]
@@ -222,12 +442,18 @@ class CornerDetector:
             cv2.circle(output, (x, y), 8, color, -1)
             cv2.circle(output, (x, y), 10, (255, 255, 255), 2)
 
-            # Draw label and coordinates
+            # Draw label and 2D coordinates
             label_text = f"{label}"
             coord_text = f"({x},{y})"
             text_pos_x, text_pos_y = x + 15, y + 5
             cv2.putText(output, label_text, (text_pos_x, text_pos_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             cv2.putText(output, coord_text, (text_pos_x, text_pos_y + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+            # Draw 3D coordinates if available
+            if corners_3d is not None:
+                x_3d, y_3d, z_3d = corners_3d[i]
+                coord_3d_text = f"3D:({x_3d:.2f},{y_3d:.2f},{z_3d:.2f})"
+                cv2.putText(output, coord_3d_text, (text_pos_x, text_pos_y + 36), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
 
         # Draw connecting lines
         for i in range(4):
@@ -237,60 +463,88 @@ class CornerDetector:
 
         return output
 
-    def add_info_overlay(self, frame: np.ndarray, has_corners: bool, fps: float) -> np.ndarray:
+    def add_info_overlay(self, frame: np.ndarray, has_corners: bool, fps: float, pose: Optional[Tuple] = None) -> np.ndarray:
         """Draw an info overlay on the top-left of the frame."""
         overlay = frame.copy()
-        cv2.rectangle(overlay, (10, 10), (300, 90), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (10, 10), (350, 120), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
 
         status = "DETECTED" if has_corners else "SEARCHING..."
         status_color = (0, 255, 0) if has_corners else (0, 0, 255)
 
-        cv2.putText(frame, "Stable Corner Detector", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        cv2.putText(frame, f"FPS: {fps:.1f}", (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(frame, status, (180, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+        cv2.putText(frame, "Stable Corner Detector (RGB+Depth)", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.putText(frame, f"FPS: {fps:.1f}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, status, (200, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+
+        if pose is not None:
+            rvec, tvec = pose
+            pose_text = f"Pose: T=({tvec[0]:.2f},{tvec[1]:.2f},{tvec[2]:.2f})"
+            cv2.putText(frame, pose_text, (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
         return frame
 
-    def process_frame(self, frame: np.ndarray, show_debug: bool = False) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    def process_frame(self, show_debug: bool = False, show_3d: bool = False) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
         """
-        Main processing pipeline for a single frame.
+        Main processing pipeline for a single RGB + Depth frame.
         Returns:
-            - Output frame with corners drawn
+            - Output RGB frame with corners drawn
             - Debug frame (if show_debug=True)
+            - 3D point cloud (if show_3d=True)
         """
-        if frame is None or frame.size == 0:
-            logger.error("Invalid frame input.")
-            return frame, None
+        # Get frames
+        rgb_frame, depth_frame = self.get_frames()
+        if rgb_frame is None or depth_frame is None:
+            logger.error("No frames captured.")
+            return None, None, None
 
         start_time = time.time()
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(rgb_frame, cv2.COLOR_BGR2GRAY)
 
         # Segment and find rectangles
-        segmented_mask = self.segment_image(frame)
-        rectangles = self.find_rectangles(segmented_mask, frame.shape)
+        segmented_mask = self.segment_image(rgb_frame, depth_frame)
+        rectangles = self.find_rectangles(segmented_mask, rgb_frame.shape)
 
-        output = frame.copy()
-        corners = None
+        output = rgb_frame.copy()
+        corners_2d = None
+        corners_3d = None
+        pose = None
 
         if rectangles:
             best_rectangle = rectangles[0]
             ordered_corners = self.order_corners(best_rectangle["corners"])
             ordered_corners = self.refine_corners(ordered_corners, gray)
-            corners = self.smooth_corners(ordered_corners)
-            output = self.draw_corners(output, corners)
+            corners_2d = self.smooth_corners(ordered_corners)
+
+            # Get 3D corners
+            corners_3d = self.get_3d_corners(
+                corners_2d,
+                depth_frame,
+                self.rgb_intrinsics,
+                self.depth_intrinsics,
+                self.depth_to_rgb_extrinsics
+            )
+            corners_3d = self.smooth_3d_corners(corners_3d)
+
+            # Estimate pose
+            pose = self.estimate_pose(corners_2d, corners_3d)
+
+            # Draw corners
+            output = self.draw_corners(output, corners_2d, corners_3d)
 
             if self.save_results:
-                self._save_corners(corners)
+                self._save_corners(corners_2d, corners_3d)
         else:
             if self.corner_history:
                 self.corner_history.popleft()
+            if self.depth_corner_history:
+                self.depth_corner_history.popleft()
 
         # Calculate FPS
         elapsed_time = time.time() - start_time
         fps = 1.0 / elapsed_time if elapsed_time > 0 else 999.0
         self.fps_history.append(fps)
         avg_fps = np.mean(self.fps_history)
-        output = self.add_info_overlay(output, corners is not None, avg_fps)
+        output = self.add_info_overlay(output, corners_2d is not None, avg_fps, pose)
 
         # Debug visualization
         debug = None
@@ -300,79 +554,113 @@ class CornerDetector:
                 color = (0, 255, 0) if i == 0 else (100, 100, 255)
                 cv2.drawContours(debug, [rect["corners"]], -1, color, 2)
 
-        return output, debug
+        # 3D visualization
+        point_cloud = None
+        if show_3d and corners_3d is not None:
+            point_cloud = self._create_point_cloud(depth_frame, rgb_frame)
 
-    def _save_corners(self, corners: np.ndarray) -> None:
-        """Save corner coordinates to a CSV file."""
+        return output, debug, point_cloud
+
+    def _save_corners(self, corners_2d: np.ndarray, corners_3d: np.ndarray) -> None:
+        """Save 2D and 3D corner coordinates to a CSV file."""
         try:
-            with open("corners.csv", "a") as f:
-                flat_corners = corners.flatten()
-                f.write(f"{time.time()},{','.join(map(str, flat_corners))}\n")
+            with open("corners_3d.csv", "a") as f:
+                flat_2d = corners_2d.flatten()
+                flat_3d = corners_3d.flatten()
+                f.write(f"{time.time()},{','.join(map(str, flat_2d))},{','.join(map(str, flat_3d))}\n")
         except Exception as e:
             logger.error("Failed to save corners: %s", e)
 
+    def _create_point_cloud(self, depth_frame: np.ndarray, rgb_frame: np.ndarray) -> np.ndarray:
+        """
+        Create a colored point cloud from depth and RGB frames.
+        Returns:
+            (N, 3) array of 3D points (X, Y, Z) with colors (R, G, B)
+        """
+        # Get depth intrinsics
+        depth_intr = self.depth_intrinsics
+
+        # Create point cloud
+        points = []
+        colors = []
+        for y in range(depth_frame.shape[0]):
+            for x in range(depth_frame.shape[1]):
+                depth = depth_frame[y, x]
+                if self.min_depth <= depth <= self.max_depth:
+                    point = rs.rs2_deproject_pixel_to_point(depth_intr, [x, y], depth)
+                    points.append(point)
+                    colors.append(rgb_frame[y, x])
+
+        points = np.array(points, dtype=np.float32)
+        colors = np.array(colors, dtype=np.uint8)
+        return points, colors
+
+    def visualize_3d(self, point_cloud: Tuple[np.ndarray, np.ndarray]) -> None:
+        """
+        Visualize the 3D point cloud using Open3D.
+        Requires: pip install open3d
+        """
+        try:
+            import open3d as o3d
+
+            points, colors = point_cloud
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(points)
+            pcd.colors = o3d.utility.Vector3dVector(colors / 255.0)
+
+            o3d.visualization.draw_geometries([pcd])
+        except ImportError:
+            logger.error("Open3D not installed. Cannot visualize 3D point cloud.")
+        except Exception as e:
+            logger.error("Failed to visualize 3D point cloud: %s", e)
+
 def main():
-    # Load config
-    detector = CornerDetector()
-
-    # Initialize camera
-    cap = cv2.VideoCapture(detector.camera_device_id)
-    if not cap.isOpened():
-        logger.error("ERROR: Cannot open webcam!")
-        return
-
-    # Set camera resolution
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, detector.camera_width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, detector.camera_height)
+    # Initialize detector
+    detector = DepthCornerDetector()
 
     # Print instructions
     print("\n" + "=" * 60)
-    print(" Stable Corner Detector Running...")
+    print(" Stable Corner Detector (RGB + Depth) Running...")
     print("  - Press 'd' to toggle debug view.")
+    print("  - Press '3' to toggle 3D visualization.")
     print("  - Press 's' to start/stop saving corner coordinates.")
     print("  - Press 'q' to quit.")
     print("=" * 60)
 
     show_debug = detector.show_debug
+    show_3d = detector.show_3d
     debug_window_name = "Debug View"
+    point_cloud_window_name = "3D Point Cloud"
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            logger.error("Failed to read frame.")
-            break
+    try:
+        while True:
+            output, debug, point_cloud = detector.process_frame(show_debug, show_3d)
 
-        output, debug = detector.process_frame(frame, show_debug)
-        cv2.imshow("Corner Detection", output)
+            if output is not None:
+                cv2.imshow("Corner Detection (RGB + Depth)", output)
 
-        if show_debug and debug is not None:
-            cv2.imshow(debug_window_name, debug)
+            if show_debug and debug is not None:
+                cv2.imshow(debug_window_name, debug)
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            break
-        elif key == ord("d"):
-            show_debug = not show_debug
-            if not show_debug:
-                cv2.destroyWindow(debug_window_name)
-        elif key == ord("s"):
-            detector.save_results = not detector.save_results
-            logger.info("Saving corners: %s", detector.save_results)
+            if show_3d and point_cloud is not None:
+                detector.visualize_3d(point_cloud)
 
-    cap.release()
-    cv2.destroyAllWindows()
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+            elif key == ord("d"):
+                show_debug = not show_debug
+                if not show_debug:
+                    cv2.destroyWindow(debug_window_name)
+            elif key == ord("3"):
+                show_3d = not show_3d
+            elif key == ord("s"):
+                detector.save_results = not detector.save_results
+                logger.info("Saving corners: %s", detector.save_results)
+
+    finally:
+        detector.pipeline.stop()
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    # Add camera settings to CornerDetector class
-    try:
-        with open("config.json", "r") as f:
-            config = json.load(f)
-            CornerDetector.camera_device_id = config["camera"]["device_id"]
-            CornerDetector.camera_width = config["camera"]["width"]
-            CornerDetector.camera_height = config["camera"]["height"]
-    except:
-        CornerDetector.camera_device_id = 1
-        CornerDetector.camera_width = 640
-        CornerDetector.camera_height = 480
-
     main()
